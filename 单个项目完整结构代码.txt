@@ -1,0 +1,565 @@
+项目 'decopy-2api' 的结构树:
+📂 decopy-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 decopy_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# decopy-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- Decopy.ai 静态凭证 (必须设置) ---
+# 已从您的抓包数据中自动提取。通常无需修改。
+PRODUCT_CODE="067003"
+PRODUCT_SERIAL="eb0f5222701cbd6e67799c0cb99ec32b"
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# decopy-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-decopy-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- Decopy.ai 静态凭证 (必须设置) ---
+# 已从您的抓包数据中自动提取。通常无需修改。
+PRODUCT_CODE="067003"
+PRODUCT_SERIAL="eb0f5222701cbd6e67799c0cb99ec32b"
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for decopy-2api (v1.0.2 - Hotfix)
+# ====================================================================
+
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# 【修正】将用户创建提前，并移除不再需要的日志目录操作
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: decopy-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - decopy-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: decopy-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    # 【修正】移除不再需要的 volumes 挂载
+    networks:
+      - decopy-net
+
+networks:
+  decopy-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import sys
+import json
+import uuid
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.decopy_provider import DecopyProvider
+
+# --- 配置 Loguru ---
+logger.remove()
+# 【修正】将主日志级别设置为 DEBUG，以在控制台显示所有详细日志
+logger.add(
+    sys.stdout,
+    level="DEBUG", 
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+           "<level>{level: <8}</level> | "
+           "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    colorize=True,
+    serialize=False
+)
+
+# --- 全局 Provider 实例 ---
+provider = DecopyProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info("服务已进入 'Cloudscraper & Async-Job-Polling & Pseudo-Stream' 模式。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+# --- 安全依赖 ---
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- API 路由 ---
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request) -> StreamingResponse:
+    try:
+        request_data = await request.json()
+        logger.info(f"收到客户端请求 /v1/chat/completions:\n{json.dumps(request_data, indent=2, ensure_ascii=False)}")
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream decopy_backend {
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        client_max_body_size 50M; # 允许上传图片
+
+        location / {
+            proxy_pass http://decopy_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+cloudscraper
+httpx
+loguru
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional, Dict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "decopy-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 decopy.ai 转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    API_MASTER_KEY: Optional[str] = None
+    
+    # Decopy.ai 静态凭证
+    PRODUCT_CODE: Optional[str] = "067003"
+    PRODUCT_SERIAL: Optional[str] = "eb0f5222701cbd6e67799c0cb99ec32b"
+
+    API_REQUEST_TIMEOUT: int = 180
+    NGINX_PORT: int = 8088
+
+    # 模型名称映射
+    MODEL_MAPPING: Dict[str, str] = {
+        "decopy-deepseek-v3": "DeepSeek-V3",
+        "decopy-gemini-2.0-flash": "Gemini-2.0-Flash",
+        "decopy-gpt-4o-mini": "GPT-4o-mini",
+        "decopy-deepseek-r1": "DeepSeek-R1"
+    }
+    DEFAULT_MODEL: str = "decopy-deepseek-v3"
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\decopy_provider.py ---
+
+import time
+import json
+import uuid
+import asyncio
+import base64
+from typing import Dict, Any, AsyncGenerator, List
+
+import cloudscraper
+import httpx
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+class DecopyProvider(BaseProvider):
+    def __init__(self):
+        self.scraper = cloudscraper.create_scraper()
+        self.create_job_url = "https://api.decopy.ai/api/decopy/ask-ai/create-job"
+        self.get_job_url_template = "https://api.decopy.ai/api/decopy/ask-ai/get-job/{job_id}"
+
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        
+        async def stream_generator() -> AsyncGenerator[bytes, None]:
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            model_name = request_data.get("model", settings.DEFAULT_MODEL)
+            
+            try:
+                headers = self._prepare_headers()
+                files, chat_id = await self._prepare_form_data(request_data)
+                
+                logger.info(f"向 Decopy 提交任务, 模型: {model_name}, Chat ID: {chat_id}")
+
+                logger.debug(f"--- [REQUEST TO DECOPY (CREATE JOB)] ---\nURL: POST {self.create_job_url}\nHeaders: {headers}\nPayload (multipart): Omitted for brevity\n-----------------------------------------")
+
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None, 
+                    lambda: self.scraper.post(self.create_job_url, headers=headers, files=files)
+                )
+                
+                response_json = response.json()
+                logger.debug(f"--- [RESPONSE FROM DECOPY (CREATE JOB)] ---\nStatus: {response.status_code}\nBody: {json.dumps(response_json, indent=2, ensure_ascii=False)}\n-------------------------------------------")
+
+                response.raise_for_status()
+                
+                if response_json.get("code") != 100000:
+                    raise HTTPException(status_code=502, detail=f"上游创建任务失败: {response_json.get('message', {}).get('zh', '未知错误')}")
+                
+                job_id = response_json.get("result", {}).get("job_id")
+                if not job_id:
+                    raise HTTPException(status_code=502, detail="上游响应中未找到 job_id。")
+                
+                logger.info(f"任务提交成功, Job ID: {job_id}. 开始获取 SSE 流...")
+
+                stream_url = self.get_job_url_template.format(job_id=job_id)
+                
+                logger.debug(f"--- [REQUEST TO DECOPY (GET STREAM)] ---\nURL: GET {stream_url}\nHeaders: {headers}\n----------------------------------------")
+                
+                stream_response = await loop.run_in_executor(
+                    None,
+                    lambda: self.scraper.get(stream_url, headers=headers, stream=True)
+                )
+                
+                logger.info(f"获取 SSE 流响应状态码: {stream_response.status_code}")
+                stream_response.raise_for_status()
+
+                # 【最终修正】正确处理增量JSON流
+                for line in stream_response.iter_lines():
+                    logger.trace(f"Raw SSE line: {line}")
+                    if line.startswith(b"data:"):
+                        content_str = line[len(b"data:"):].strip().decode('utf-8', errors='ignore')
+                        
+                        if content_str == 'Data transfer completed.':
+                            logger.info("检测到 'Data transfer completed.' 消息，流结束。")
+                            continue
+                        
+                        if not content_str:
+                            continue
+                            
+                        try:
+                            # 解析每一行独立的 JSON 对象
+                            data = json.loads(content_str)
+                            # 提取 'data' 字段作为增量内容
+                            delta_content = data.get("data")
+                            
+                            if delta_content is not None:
+                                # 直接将增量内容封装并发送
+                                chunk = create_chat_completion_chunk(request_id, model_name, delta_content)
+                                yield create_sse_data(chunk)
+                        except json.JSONDecodeError:
+                            logger.warning(f"无法解析 SSE 数据块: {content_str}")
+                            continue
+                
+                logger.info(f"Job ID: {job_id} 的流处理完毕。")
+                final_chunk = create_chat_completion_chunk(request_id, model_name, "", "stop")
+                yield create_sse_data(final_chunk)
+                yield DONE_CHUNK
+
+            except Exception as e:
+                logger.error(f"处理流时发生错误: {e}", exc_info=True)
+                error_message = f"内部服务器错误: {str(e)}"
+                error_chunk = create_chat_completion_chunk(request_id, model_name, error_message, "stop")
+                yield create_sse_data(error_chunk)
+                yield DONE_CHUNK
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    def _prepare_headers(self) -> Dict[str, str]:
+        return {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://decopy.ai",
+            "Referer": "https://decopy.ai/",
+            "product-code": settings.PRODUCT_CODE,
+            "product-serial": settings.PRODUCT_SERIAL,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        }
+
+    async def _prepare_form_data(self, request_data: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+        messages = request_data.get("messages", [])
+        if not messages:
+            raise HTTPException(status_code=400, detail="请求中缺少 'messages' 字段。")
+
+        last_user_message = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        if not last_user_message or not last_user_message.get("content"):
+            raise HTTPException(status_code=400, detail="未找到有效的用户消息。")
+
+        prompt_text = ""
+        image_url = None
+        
+        content = last_user_message["content"]
+        if isinstance(content, str):
+            prompt_text = content
+        elif isinstance(content, list):
+            for part in content:
+                if part.get("type") == "text":
+                    prompt_text = part.get("text", "")
+                elif part.get("type") == "image_url":
+                    image_url = part.get("image_url", {}).get("url")
+
+        model_name = request_data.get("model", settings.DEFAULT_MODEL)
+        actual_model = settings.MODEL_MAPPING.get(model_name, "DeepSeek-V3")
+        
+        chat_id = str(uuid.uuid4())
+        
+        files = {
+            "entertext": (None, prompt_text),
+            "chat_id": (None, chat_id),
+            "model": (None, actual_model),
+            "chat_group": (None, ""),
+        }
+
+        if image_url:
+            logger.info(f"检测到图片 URL，正在下载: {image_url[:100]}...")
+            async with httpx.AsyncClient() as client:
+                if image_url.startswith("data:image/"):
+                    header, encoded = image_url.split(",", 1)
+                    image_bytes = base64.b64decode(encoded)
+                    file_extension = header.split("/")[1].split(";")[0]
+                else:
+                    response = await client.get(image_url)
+                    response.raise_for_status()
+                    image_bytes = response.content
+                    file_extension = image_url.split('.')[-1].split('?')[0] or 'jpg'
+
+            files["upload_images"] = (f"image.{file_extension}", image_bytes, f"image/{file_extension}")
+            logger.info(f"图片已准备好上传，大小: {len(image_bytes)} bytes")
+
+        return files, chat_id
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.MODEL_MAPPING.keys()
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+def create_sse_data(data: Dict[str, Any]) -> str:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+# --- [新增] 创建与 OpenAI 兼容的非流式聊天补全响应 ---
+def create_chat_completion_response(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: str
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的完整、非流式聊天补全响应。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": finish_reason
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0, # 注意：目前无法从上游获取准确的 token 数
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    }
+
+DONE_CHUNK = create_sse_data({"id": "done", "object": "done", "choices": [], "created": int(time.time()), "model": "done"})
+
+
+
