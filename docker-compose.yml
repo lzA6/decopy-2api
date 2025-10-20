@@ -1,0 +1,29 @@
+services:
+  nginx:
+    image: nginx:latest
+    container_name: decopy-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - decopy-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: decopy-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    # 【修正】移除不再需要的 volumes 挂载
+    networks:
+      - decopy-net
+
+networks:
+  decopy-net:
+    driver: bridge
